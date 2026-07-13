@@ -4,9 +4,11 @@
   python -m agent.cli --selfcheck                                  # Day1：自检骨架是否装好
   python -m agent.cli "创建 hello.py 并运行"                         # Day5 起：真正跑任务
   python -m agent.cli "介绍张老师" -a                                # 展示完整模型输出含引用验证标记
+  python -m agent.cli                                               # 交互式 REPL 模式（无参数时进入）
 """
 from __future__ import annotations
 import argparse
+import json
 import os
 import sys
 
@@ -41,6 +43,244 @@ def selfcheck() -> int:
     return 0 if ok else 1
 
 
+def interactive(backend, registry, system_prompt, tracer=None) -> int:
+    """交互式 REPL 模式——类似 Claude Code 的持续对话体验。"""
+    # 管道/重定向场景下不使用 Rich（避免编码问题）
+    import sys as _sys
+    if not _sys.stdin.isatty():
+        return _interactive_plain(backend, registry, system_prompt, tracer)
+
+    try:
+        from rich.console import Console
+        from rich.markdown import Markdown
+        from rich.panel import Panel
+    except ImportError:
+        # Fallback: plain text REPL without Rich formatting
+        return _interactive_plain(backend, registry, system_prompt, tracer)
+
+    # ── 输入层：优先使用 prompt_toolkit（跨平台终端输入支持好）──
+    try:
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.history import InMemoryHistory
+        from prompt_toolkit.styles import Style as PTStyle
+        from prompt_toolkit.key_binding import KeyBindings
+        _USE_PT = True
+    except ImportError:
+        _USE_PT = False
+
+    console = Console()
+    messages = None  # 首次对话从空白开始
+
+    console.print()
+    console.print(Panel.fit(
+        "[bold cyan]mini-OpenClaw[/] — 交互模式",
+        border_style="cyan",
+    ))
+    console.print(
+        "[dim]输入任务描述开始对话，"
+        "[bold]/exit[/] 退出  [bold]/clear[/] 清空  [bold]/help[/] 帮助[/]"
+    )
+    console.print()
+
+    # ── 配置 prompt_toolkit session ──
+    if _USE_PT:
+        session = PromptSession(history=InMemoryHistory())
+        kb = KeyBindings()
+
+        @kb.add("c-c")
+        def _handle_ctrl_c(event):
+            """Ctrl+C → 退出交互模式"""
+            event.app.exit(exception=KeyboardInterrupt)
+
+        @kb.add("c-d")
+        def _handle_ctrl_d(event):
+            """Ctrl+D → 退出交互模式（空输入时）"""
+            if event.current_buffer.text == "":
+                event.app.exit(exception=EOFError)
+            else:
+                # 非空输入时 Ctrl+D 为删除操作
+                event.current_buffer.delete()
+
+        @kb.add("escape", "enter")
+        def _handle_alt_enter(event):
+            """Alt+Enter → 插入换行（多行输入）"""
+            event.current_buffer.insert_text("\n")
+
+        pt_style = PTStyle.from_dict({
+            "prompt": "bold cyan",
+        })
+
+    # ── 获取输入的辅助函数 ──
+    def _read_input(prompt_text, is_continuation=False):
+        """跨平台输入获取。"""
+        if _USE_PT:
+            try:
+                if is_continuation:
+                    return session.prompt(
+                        [("class:prompt", "  ")],
+                        style=pt_style,
+                        key_bindings=kb,
+                        multiline=False,
+                    ).strip()
+                else:
+                    return session.prompt(
+                        [("class:prompt", "▸ ")],
+                        style=pt_style,
+                        key_bindings=kb,
+                        multiline=False,
+                    ).strip()
+            except (EOFError, KeyboardInterrupt):
+                raise
+        else:
+            # Fallback: plain input()
+            try:
+                return input(prompt_text).strip()
+            except (EOFError, KeyboardInterrupt):
+                raise
+
+    # ── 主循环 ──
+    while True:
+        try:
+            task = _read_input("▸ ")
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]再见！[/]")
+            break
+
+        if task in ("/exit", "/quit"):
+            break
+
+        if task == "/clear":
+            messages = None
+            console.print("[dim]✓ 对话已清空[/]")
+            console.print()
+            continue
+
+        if task == "/help":
+            console.print("""
+[bold]可用命令：[/]
+  [bold]/exit[/]    退出交互模式
+  [bold]/clear[/]   清空对话历史，开始新对话
+  [bold]/help[/]    显示此帮助信息
+
+[bold]快捷键：[/]
+  [bold]Ctrl+C[/]    退出交互模式
+  [bold]Alt+Enter[/] 插入换行（多行输入）
+  [bold]右键[/]      粘贴剪贴板内容
+
+[bold]使用技巧：[/]
+  直接输入自然语言任务，Agent 会自动调用工具完成。
+  以 [bold]\\[/] 结尾可续行（多行输入）。
+  对话上下文在多次输入间自动保留。
+""")
+            continue
+
+        if not task:
+            continue
+
+        # 多行输入支持：以 \ 结尾则续行
+        while task.rstrip().endswith("\\"):
+            continuation = _read_input("  ", is_continuation=True)
+            task = task.rstrip()[:-1] + "\n" + continuation
+
+        # ── 运行 Agent ──
+        from agent.loop import AgentLoop
+        agent = AgentLoop(backend, registry, system_prompt, tracer=tracer)
+
+        try:
+            for event_type, data in agent.run_stream(task, messages):
+                if event_type == "thinking":
+                    console.print("  [dim]⏳ 思考中...[/]", end="\r")
+
+                elif event_type == "tool_call":
+                    name = data["name"]
+                    args_str = json.dumps(data.get("arguments", {}), ensure_ascii=False)
+                    if len(args_str) > 80:
+                        args_str = args_str[:77] + "..."
+                    console.print(f"  [dim]🔧 {name}({args_str})[/]", end="")
+
+                elif event_type == "tool_result":
+                    success = data.get("success", True)
+                    icon = "[green]✓[/]" if success else "[red]✗[/]"
+                    first_line = data.get("result", "").split("\n")[0][:100]
+                    console.print(f" {icon} [dim]{first_line}[/]")
+
+                elif event_type == "done":
+                    content = data.get("content", "")
+                    messages = data.get("messages")
+                    console.print(" " * 30)  # 清掉 "思考中..." 行
+                    if content:
+                        console.print(Markdown(content))
+                    console.print()
+
+                elif event_type == "error":
+                    console.print(f"  [red]⚠ {data['message']}[/]")
+
+        except Exception as e:
+            console.print(f"  [red]运行错误: {e}[/]")
+            console.print()
+
+    return 0
+
+
+def _interactive_plain(backend, registry, system_prompt, tracer=None) -> int:
+    """Rich 不可用时的纯文本回退 REPL。"""
+    print("\nmini-OpenClaw 交互模式（纯文本）")
+    print("输入任务开始，/exit 退出，/clear 清空，/help 帮助\n")
+
+    messages = None
+
+    while True:
+        try:
+            task = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n再见！")
+            break
+
+        if task in ("/exit", "/quit"):
+            break
+        if task == "/clear":
+            messages = None
+            print("[已清空]")
+            continue
+        if task == "/help":
+            print("  /exit  退出  /clear  清空  /help  帮助  \\  续行")
+            continue
+        if not task:
+            continue
+
+        while task.rstrip().endswith("\\"):
+            task = task.rstrip()[:-1] + "\n" + input("  ").strip()
+
+        from agent.loop import AgentLoop
+        agent = AgentLoop(backend, registry, system_prompt, tracer=tracer)
+
+        try:
+            for event_type, data in agent.run_stream(task, messages):
+                if event_type == "tool_call":
+                    name = data["name"]
+                    args_str = json.dumps(data.get("arguments", {}), ensure_ascii=False)
+                    if len(args_str) > 60:
+                        args_str = args_str[:57] + "..."
+                    print(f"  [tool] {name}({args_str})", end="", flush=True)
+                elif event_type == "tool_result":
+                    success = data.get("success", True)
+                    icon = "OK" if success else "FAIL"
+                    print(f" -> {icon}")
+                elif event_type == "done":
+                    content = data.get("content", "")
+                    messages = data.get("messages")
+                    print()
+                    if content:
+                        print(content)
+                    print()
+                elif event_type == "error":
+                    print(f"  [ERROR] {data['message']}")
+        except Exception as e:
+            print(f"  [ERROR] {e}\n")
+
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="mini-openclaw")
     p.add_argument("task", nargs="?", help="要让 agent 完成的任务（自然语言）")
@@ -49,10 +289,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="显示完整模型输出（含引用验证错误标记）")
     args = p.parse_args(argv)
 
-    if args.selfcheck or not args.task:
+    if args.selfcheck:
         return selfcheck()
 
-    # 真正跑任务：优先用 DeepSeek API；没配 key 时回退到 FakeBackend（离线打通管道）
+    # ── 共享的初始化代码（单次模式和交互模式共用）──
     from agent.loop import AgentLoop
     reg = build_default_registry()
     from mcp.client import MCPClient, register_mcp_tools
@@ -111,6 +351,24 @@ def main(argv: list[str] | None = None) -> int:
         os.makedirs(".agent_traces", exist_ok=True)
         tracer = Tracer(_trace_path)
 
+        # ── 交互模式（无任务参数时进入 REPL）──
+        if not args.task:
+            try:
+                return interactive(backend, reg, system, tracer)
+            finally:
+                # 安全：确保 MCP 子进程被清理
+                if echo_mcp is not None:
+                    try:
+                        echo_mcp.close()
+                    except Exception:
+                        pass
+                if filesystem_mcp is not None:
+                    try:
+                        filesystem_mcp.close()
+                    except Exception:
+                        pass
+
+        # ── 单次执行模式 ──
         agent = AgentLoop(backend, reg, system, tracer=tracer)
         result = agent.run(args.task)
         print(f"\n[可观测] 轨迹已保存至 {_trace_path}（可通过 eval.tracer.replay 回放）")

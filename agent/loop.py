@@ -29,6 +29,8 @@ _HIGH_RISK_TOOLS = {"bash", "write", "edit"}
 _MAX_HIGH_RISK_CALLS = 30
 # 连续错误上限（防止死循环）
 _MAX_CONSECUTIVE_ERRORS = 3
+# 重复调用检测窗口大小
+_MAX_REPEAT_CALLS = 5
 
 # ── 错误分类 ──────────────────────────────────────────────────────
 
@@ -78,7 +80,6 @@ class AgentLoop:
         step = 0
         # 重复调用检测：跟踪最近 N 次工具调用签名，防止死循环
         _recent_call_sigs: list[str] = []
-        _MAX_REPEAT_CALLS = 5
 
         for turn in range(self.max_turns):
             step += 1
@@ -199,3 +200,182 @@ class AgentLoop:
             messages = maybe_compact(messages, self.backend)
 
         return "[达到最大轮数上限，未完成任务]"
+
+    def run_stream(self, user_task: str, messages: list[dict[str, Any]] | None = None):
+        """Generator yielding (event_type, data) tuples for real-time display.
+
+        Yields:
+          ('thinking', {})
+          ('tool_call', {'name': str, 'arguments': dict, 'id': str})
+          ('tool_result', {'name': str, 'result': str, 'success': bool, 'id': str})
+          ('done', {'content': str, 'messages': list})
+          ('error', {'message': str})
+
+        Pass ``messages`` to continue an existing conversation (the caller
+        should pass the list returned in the ``'done'`` event from the
+        previous call).  If omitted, a fresh conversation is started.
+        """
+        if messages is None:
+            messages = [
+                {"role": "system", "content": self.system_prompt},
+            ]
+
+        # Only append user message if it's not already at the tail
+        if (not messages or
+                messages[-1].get("role") != "user" or
+                messages[-1].get("content") != user_task):
+            messages.append({"role": "user", "content": user_task})
+
+        total_calls = 0
+        high_risk_calls = 0
+        consecutive_errors = 0
+        step = 0
+        _recent_call_sigs: list[str] = []
+
+        for _turn in range(self.max_turns):
+            step += 1
+
+            yield ("thinking", {})
+
+            assistant = self.backend.chat(
+                messages,
+                tools=self.registry.schemas(),
+            )
+
+            # ── 可观测性：记录轨迹 ──
+            if self.tracer is not None:
+                usage = assistant.get("usage", {})
+                tool_names = [tc["name"] for tc in (assistant.get("tool_calls") or [])]
+                self.tracer.log_step(
+                    step=step,
+                    tool_calls=assistant.get("tool_calls") or [],
+                    prompt_tokens=usage.get("prompt_tokens", 0),
+                    completion_tokens=usage.get("completion_tokens", 0),
+                    note="; ".join(tool_names) if tool_names else "最终答复",
+                )
+
+            messages.append({
+                "role": "assistant",
+                "content": assistant.get("content") or "",
+                "tool_calls": assistant.get("tool_calls") or [],
+            })
+
+            tool_calls = assistant.get("tool_calls") or []
+
+            if not tool_calls:
+                _recent_call_sigs.clear()
+                yield ("done", {
+                    "content": assistant.get("content", ""),
+                    "messages": messages,
+                })
+                return
+
+            # ── 重复调用检测：记录本轮签名 ──
+            for call in tool_calls:
+                sig = f"{call['name']}:{json.dumps(call.get('arguments', {}), sort_keys=True, ensure_ascii=False)}"
+                _recent_call_sigs.append(sig)
+            if len(_recent_call_sigs) > _MAX_REPEAT_CALLS:
+                _recent_call_sigs.pop(0)
+
+            # ── 执行所有工具 ──
+            for call in tool_calls:
+                # ── 配额检查 ──
+                total_calls += 1
+                if total_calls > _MAX_TOTAL_CALLS:
+                    obs = f"[安全配额] 已达到全局工具调用上限（{_MAX_TOTAL_CALLS} 次），拒绝执行 {call['name']}"
+                    messages.append({
+                        "role": "tool", "name": call["name"],
+                        "tool_call_id": call.get("id"), "content": obs,
+                    })
+                    yield ("tool_result", {
+                        "name": call["name"], "result": obs,
+                        "success": False, "id": call.get("id"),
+                    })
+                    continue
+
+                if call["name"] in _HIGH_RISK_TOOLS:
+                    high_risk_calls += 1
+                    if high_risk_calls > _MAX_HIGH_RISK_CALLS:
+                        obs = f"[安全配额] 高风险工具 '{call['name']}' 已达到配额上限（{_MAX_HIGH_RISK_CALLS} 次），拒绝执行"
+                        messages.append({
+                            "role": "tool", "name": call["name"],
+                            "tool_call_id": call.get("id"), "content": obs,
+                        })
+                        yield ("tool_result", {
+                            "name": call["name"], "result": obs,
+                            "success": False, "id": call.get("id"),
+                        })
+                        continue
+
+                # ── 通知前端：工具调用开始 ──
+                yield ("tool_call", {
+                    "name": call["name"],
+                    "arguments": call.get("arguments", {}),
+                    "id": call.get("id"),
+                })
+
+                tool = self.registry.get(call["name"])
+
+                if tool is None:
+                    obs = f"错误：未知工具 {call['name']}。可用工具：{', '.join(self.registry.names())}"
+                    consecutive_errors += 1
+                    success = False
+                else:
+                    try:
+                        obs = tool.run(**call.get("arguments", {}))
+                        consecutive_errors = 0
+                        success = True
+                    except Exception as e:
+                        hint = _classify_error(e, call["name"])
+                        obs = f"工具 {call['name']} 执行出错：{e}\n[修复建议] {hint}"
+                        consecutive_errors += 1
+                        success = False
+
+                if consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
+                    obs += f"\n\n⚠️ 已连续 {consecutive_errors} 次错误，任务可能无法继续。"
+
+                messages.append({
+                    "role": "tool", "name": call["name"],
+                    "tool_call_id": call.get("id"),
+                    "content": truncate_observation(str(obs)),
+                })
+
+                # ── 通知前端：工具结果 ──
+                yield ("tool_result", {
+                    "name": call["name"],
+                    "result": truncate_observation(str(obs)),
+                    "success": success,
+                    "id": call.get("id"),
+                })
+
+            # ── 循环检测 ──
+            if len(_recent_call_sigs) >= _MAX_REPEAT_CALLS and len(set(_recent_call_sigs)) == 1:
+                stuck_call = tool_calls[0]["name"]
+                stuck_args = tool_calls[0].get("arguments", {})
+                _already_warned = any(
+                    msg.get("role") == "user" and "[循环检测]" in str(msg.get("content", ""))
+                    for msg in messages[-3:]
+                )
+                if _already_warned:
+                    content = (
+                        f"[检测到模型陷入循环] 连续 {_MAX_REPEAT_CALLS} 次调用 "
+                        f"{stuck_call}({json.dumps(stuck_args, ensure_ascii=False)})，"
+                        f"注入提示后仍未纠正，自动终止。"
+                    )
+                    yield ("done", {"content": content, "messages": messages})
+                    return
+                hint = (
+                    f"⚠️ [循环检测] 你已经连续 {_MAX_REPEAT_CALLS} 次调用了相同的 "
+                    f"{stuck_call}({json.dumps(stuck_args, ensure_ascii=False)})。"
+                    f"请立即改变策略。"
+                )
+                messages.append({"role": "user", "content": hint})
+                _recent_call_sigs.clear()
+
+            # 本轮所有工具执行结束后，再判断是否需要压缩上下文
+            messages = maybe_compact(messages, self.backend)
+
+        yield ("done", {
+            "content": "[达到最大轮数上限，未完成任务]",
+            "messages": messages,
+        })
